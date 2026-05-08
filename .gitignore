@@ -1,0 +1,45 @@
+# Wandb logs
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Models and results (large files)
+artifacts/models/
+artifacts/results/
+
+# IDE
+.vscode/
+
+# Claude
+.claude/
+
+# Other tool configs
+.agents/
+.aris/
+.pi/
+skills-lock.json
+
+# Other projects
+ARIS/
+EvoScientist/
+EvoScientist-claude/
+Auto-claude-code-research-in-sleep/
+world-model-locomotion/
+
+# Archives
+*.zip
+
+# Project docs (separate from code)
+idea-stage/
+review-stage/
+paper/
+literature_review_integrated_EW_HRL.md
+output_modules.md
+
+# OS
+.DS_Store
+Thumbs.db
