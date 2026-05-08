@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import ExperimentConfig
 from env import IntegratedRadarEnv
-from training import HRLTrainer, CurriculumScheduler
+from training import CoordinatedTrainer, CurriculumScheduler
 from baselines import IndependentRLAgent, FixedPolicyAgent, RandomBaseline
 from eval import Evaluator, Visualizer
 
@@ -32,9 +32,9 @@ def set_seed(seed: int):
 
 
 def train_hrl(config: ExperimentConfig) -> dict:
-    """Train the three-layer HRL agent."""
+    """Train the coordinated HRL agent (Coordinator + 4 Function PPOs)."""
     set_seed(config.seed)
-    trainer = HRLTrainer(config)
+    trainer = CoordinatedTrainer(config)
     results = trainer.train()
     trainer.save_results()
     trainer.save_checkpoint()
@@ -42,13 +42,13 @@ def train_hrl(config: ExperimentConfig) -> dict:
 
 
 def evaluate_hrl(config: ExperimentConfig, checkpoint_path: str) -> dict:
-    """Evaluate a trained HRL agent."""
-    trainer = HRLTrainer(config)
+    """Evaluate a trained coordinated HRL agent."""
+    trainer = CoordinatedTrainer(config)
 
     ckpt = torch.load(checkpoint_path, map_location=trainer.device)
-    trainer.strategic.load_state_dict(ckpt["strategic"])
-    trainer.tactical_ppo.policy.load_state_dict(ckpt["tactical_policy"])
-    trainer.executive_ppo.policy.load_state_dict(ckpt["executive_policy"])
+    trainer.coord_ppo.policy.load_state_dict(ckpt["coord_policy"])
+    for name in ["detect", "recon", "jam", "comm"]:
+        trainer.func_ppos[name].policy.load_state_dict(ckpt[f"{name}_policy"])
 
     metrics = trainer.evaluate()
     print(f"\nEvaluation Results:")
@@ -92,7 +92,7 @@ def run_baselines(config: ExperimentConfig) -> dict:
 def full_experiment(config: ExperimentConfig) -> dict:
     """Run the complete experiment pipeline."""
     print("\n" + "=" * 70)
-    print("FULL EXPERIMENT: Three-Layer HRL for Integrated EW")
+    print("FULL EXPERIMENT: Coordinated HRL for Integrated EW")
     print("  Detection (探) + Reconnaissance (侦) + Jamming (干) + Communication (通)")
     print("=" * 70)
 
@@ -162,28 +162,28 @@ def full_experiment(config: ExperimentConfig) -> dict:
 
 
 def run_ablation(config: ExperimentConfig) -> dict:
-    """Run ablation study: remove each HRL layer and measure impact."""
+    """Run ablation study: remove each component and measure impact."""
     results = {}
 
-    # Full HRL (reference)
+    # Full coordinated HRL (reference)
     set_seed(config.seed)
-    trainer_full = HRLTrainer(config)
+    trainer_full = CoordinatedTrainer(config)
     full_results = trainer_full.train()
-    results["Full HRL"] = full_results["metrics_history"][-1]["eval_reward_mean"]
+    results["Full Coord HRL"] = full_results["metrics_history"][-1]["eval_reward_mean"]
 
-    # Without strategic layer (flat SAC)
-    print("  Running: No Strategic Layer (flat SAC)...")
+    # Without coordinator (flat function PPOs)
+    print("  Running: No Coordinator (flat function PPOs)...")
     from baselines.independent_rl import IndependentRLAgent
     agent = IndependentRLAgent(config)
     flat_results = agent.train(total_steps=config.total_steps // 2)
-    results["No Strategic Layer"] = flat_results["metrics"][-1]["mean_reward"]
+    results["No Coordinator"] = flat_results["metrics"][-1]["mean_reward"]
 
     # Without curriculum learning
-    print("  Running: No Curriculum (random init)...")
+    print("  Running: No Curriculum...")
     config_no_cl = ExperimentConfig()
     config_no_cl.curriculum.steps_per_stage = config.total_steps
     set_seed(config.seed)
-    trainer_nocl = HRLTrainer(config_no_cl)
+    trainer_nocl = CoordinatedTrainer(config_no_cl)
     nocl_results = trainer_nocl.train()
     results["No Curriculum"] = nocl_results["metrics_history"][-1]["eval_reward_mean"]
 

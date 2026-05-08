@@ -43,28 +43,28 @@ class EnvConfig:
 
 @dataclass
 class HRLConfig:
-    # Strategic layer (Options-based)
+    # Strategic layer (Options-based) — now Coordinator budget
     strategic_lr: float = 3e-4
     strategic_hidden: int = 256
-    strategic_options: int = 8  # number of option policies
-    option_duration_min: int = 4
-    option_duration_max: int = 32
+    strategic_options: int = 8  # number of option policies (kept for compat)
+    option_duration_min: int = 8
+    option_duration_max: int = 24
 
-    # Tactical layer (Multi-agent resource allocation)
+    # Tactical layer (Multi-agent resource allocation) — now function policies
     tactical_lr: float = 3e-4
-    tactical_hidden: int = 128
+    tactical_hidden: int = 256
 
     # Executive layer (Continuous parameter control)
     executive_lr: float = 3e-4
-    executive_hidden: int = 128
+    executive_hidden: int = 256
 
     # Shared
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
-    rollout_length: int = 512
+    rollout_length: int = 2048
     update_epochs: int = 10
-    batch_size: int = 256
+    batch_size: int = 512
     buffer_capacity: int = 1_000_000
     reward_scale: float = 2.0
 

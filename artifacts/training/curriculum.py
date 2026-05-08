@@ -17,7 +17,7 @@ class CurriculumScheduler:
             "target_hostile_ratio": 0.0,
             "jam_power_max_db": 0.0,
             "success_threshold": 0.75,
-            "min_steps": 20_000,
+            "min_steps": 5_000,
         },
         {
             "name": "detect_jam",
@@ -28,7 +28,7 @@ class CurriculumScheduler:
             "target_hostile_ratio": 0.5,
             "jam_power_max_db": 50.0,
             "success_threshold": 0.65,
-            "min_steps": 30_000,
+            "min_steps": 15_000,
         },
         {
             "name": "detect_recon_jam",
@@ -39,7 +39,7 @@ class CurriculumScheduler:
             "target_hostile_ratio": 0.5,
             "jam_power_max_db": 60.0,
             "success_threshold": 0.60,
-            "min_steps": 30_000,
+            "min_steps": 20_000,
         },
         {
             "name": "full_integrated",
@@ -50,11 +50,11 @@ class CurriculumScheduler:
             "target_hostile_ratio": 0.5,
             "jam_power_max_db": 70.0,
             "success_threshold": None,  # No early exit from final stage
-            "min_steps": 50_000,
+            "min_steps": 30_000,
         },
     ]
 
-    def __init__(self, steps_per_stage: int = 50_000):
+    def __init__(self, steps_per_stage: int = 30_000):
         self.steps_per_stage = steps_per_stage
         self.current_stage = 0
         self.stage_step = 0

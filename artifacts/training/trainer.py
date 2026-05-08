@@ -1,28 +1,45 @@
-"""Three-layer HRL trainer with PPO and curriculum learning."""
+"""Two-layer HRL trainer: Coordinator + 4 Function Policies (all PPO).
+
+Architecture:
+  Coordinator (PPO, 24-dim budget, updated every 8-16 steps)
+    ├── Detection Policy   (PPO, 34-dim, every step)
+    ├── Recon Policy       (PPO, 34-dim, every step)
+    ├── Jamming Policy     (PPO, 34-dim, every step)
+    └── Communication Policy (PPO, 34-dim, every step)
+
+Each function policy sees obs + coordinator budget, outputs its part of the
+136-dim action, and gets its own per-function reward for GAE computation.
+"""
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Categorical
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import copy
 import os
 import json
 import time
+
 import wandb
 
 from config import ExperimentConfig
 from env.radar_env import IntegratedRadarEnv
-from agents.networks import StrategicNetwork
-from agents.buffers import HRLReplayBuffer, RolloutBuffer
+from agents.buffers import RolloutBuffer
 from .ppo_trainer import PPOTrainer
 from .curriculum import CurriculumScheduler
 from .normalization import ObservationNormalizer, RewardNormalizer
 
 
-class HRLTrainer:
-    """Orchestrates three-layer HRL training with PPO for sub-policies."""
+# Function action dimensions: freq(16) + beam_az(2) + beam_el(2) + power(1) +
+#   waveform(8) + time(1) + code(4) = 34 each
+FUNC_ACTION_DIM = 34
+COORD_ACTION_DIM = 24  # 6 resources x 4 functions
+
+FUNC_NAMES = ["detect", "recon", "jam", "comm"]
+
+
+class CoordinatedTrainer:
+    """Coordinator + 4 Function Policies architecture (all PPO)."""
 
     def __init__(self, config: ExperimentConfig):
         self.cfg = config
@@ -31,7 +48,7 @@ class HRLTrainer:
         )
         print(f"Using device: {self.device}")
 
-        # Create environment (train + separate eval to avoid state corruption)
+        # Create environment
         self.env = IntegratedRadarEnv(
             config=config.env,
             curriculum_stage=0,
@@ -40,60 +57,60 @@ class HRLTrainer:
         act_dim = self.env.action_space.shape[0]
         self.obs_dim = obs_dim
         self.act_dim = act_dim
-        self.resource_dim = 24  # 4 functions x 6 dimensions
+        assert act_dim == FUNC_ACTION_DIM * 4, \
+            f"Action dim {act_dim} != 4 x {FUNC_ACTION_DIM}"
 
         # Observation and reward normalization
         self.obs_normalizer = ObservationNormalizer(shape=(obs_dim,), clip_obs=10.0)
         self.reward_normalizer = RewardNormalizer(gamma=config.hrl.gamma)
 
-        # Strategic network (Options-based, discrete actions -> REINFORCE + baseline)
-        self.strategic = StrategicNetwork(
-            obs_dim, config.hrl.strategic_options, config.hrl.strategic_hidden,
-        ).to(self.device)
-        self.strategic_optim = optim.Adam(
-            self.strategic.parameters(), lr=config.hrl.strategic_lr,
+        # Coordinator PPO: obs -> 24-dim budget
+        coord_hidden = max(config.hrl.strategic_hidden, COORD_ACTION_DIM * 3)
+        self.coord_ppo = PPOTrainer(
+            state_dim=obs_dim,
+            action_dim=COORD_ACTION_DIM,
+            hidden=coord_hidden,
+            lr=config.hrl.strategic_lr,
+            gamma=config.hrl.gamma,
+            gae_lambda=config.hrl.gae_lambda,
+            clip_coef=config.hrl.clip_epsilon,
+            ent_coef=0.05,
+            target_kl=0.015,
+            update_epochs=config.hrl.update_epochs,
+            device=self.device,
         )
 
-        # Persistent buffer for strategic transitions (off-policy style, mixed options)
-        self.strategic_buffer = HRLReplayBuffer(
-            config.hrl.buffer_capacity, obs_dim, act_dim,
-            config.hrl.strategic_options, self.resource_dim,
-        )
+        # 4 Function PPO policies: obs + budget -> 34-dim sub-action
+        func_hidden = max(config.hrl.executive_hidden, FUNC_ACTION_DIM * 3)
+        func_state_dim = obs_dim + COORD_ACTION_DIM
+        self.func_ppos = {}
+        self.func_optimizers = []
+        for name in FUNC_NAMES:
+            ppo = PPOTrainer(
+                state_dim=func_state_dim,
+                action_dim=FUNC_ACTION_DIM,
+                hidden=func_hidden,
+                lr=config.hrl.executive_lr,
+                gamma=config.hrl.gamma,
+                gae_lambda=config.hrl.gae_lambda,
+                clip_coef=config.hrl.clip_epsilon,
+                ent_coef=0.05,
+                target_kl=0.015,
+                update_epochs=config.hrl.update_epochs,
+                device=self.device,
+            )
+            self.func_ppos[name] = ppo
 
-        # On-policy rollout buffer for PPO (tactical + executive)
+        # Rollout buffer (on-policy for all policies)
         self.rollout_length = getattr(config.hrl, 'rollout_length', 2048)
-        self.rollout = RolloutBuffer(
-            self.rollout_length + 200,  # extra space for episode boundaries
-            obs_dim, act_dim, config.hrl.strategic_options, self.resource_dim,
+        buffer_cap = self.rollout_length + 200
+        self.rollout = _CoordRolloutBuffer(
+            buffer_cap, obs_dim, COORD_ACTION_DIM, FUNC_ACTION_DIM,
         )
 
-        # Curriculum scheduler
+        # Curriculum
         self.curriculum = CurriculumScheduler(
             steps_per_stage=config.curriculum.steps_per_stage,
-        )
-
-        # PPO trainers for tactical and executive layers
-        self.tactical_ppo = PPOTrainer(
-            obs_dim + config.hrl.strategic_options,
-            self.resource_dim,
-            hidden=config.hrl.tactical_hidden,
-            lr=config.hrl.tactical_lr,
-            gamma=config.hrl.gamma,
-            gae_lambda=config.hrl.gae_lambda,
-            clip_coef=config.hrl.clip_epsilon,
-            update_epochs=config.hrl.update_epochs,
-            device=self.device,
-        )
-        self.executive_ppo = PPOTrainer(
-            obs_dim + self.resource_dim,
-            act_dim,
-            hidden=config.hrl.executive_hidden,
-            lr=config.hrl.executive_lr,
-            gamma=config.hrl.gamma,
-            gae_lambda=config.hrl.gae_lambda,
-            clip_coef=config.hrl.clip_epsilon,
-            update_epochs=config.hrl.update_epochs,
-            device=self.device,
         )
 
         self.total_steps = 0
@@ -101,37 +118,39 @@ class HRLTrainer:
         self.metrics_history = []
         self._update_count = 0
 
-        # Preserve original env config for eval (curriculum mutates self.cfg.env)
+        # Preserve original env config for eval
         self._eval_env_config = copy.deepcopy(config.env)
 
     def train(self) -> Dict:
-        """Main training loop with PPO rollout-update cycle."""
+        """Main training loop."""
         print(f"\n{'='*60}")
-        print("Starting Three-Layer HRL Training (PPO)")
+        print("Starting Coordinated HRL Training (Coordinator + 4 Function PPOs)")
         print(f"Total steps: {self.cfg.total_steps}")
         print(f"Rollout length: {self.rollout_length}")
-        print(f"Curriculum stages: {len(CurriculumScheduler.STAGES)}")
+        print(f"Coordinator: {COORD_ACTION_DIM}-dim budget, updated every "
+              f"{self.cfg.hrl.option_duration_min}-{self.cfg.hrl.option_duration_max} steps")
+        print(f"Function policies: {FUNC_ACTION_DIM}-dim each x 4 = {self.act_dim}-dim total")
         print(f"{'='*60}\n")
 
         wandb.init(
             project="integrated-ew-hrl",
-            name=f"hrl_ppo_s{self.cfg.seed}",
+            name=f"coord_ppo_s{self.cfg.seed}",
             config={
                 "total_steps": self.cfg.total_steps,
                 "seed": self.cfg.seed,
-                "architecture": "Three-Layer HRL (Strategic->Tactical->Executive) with PPO",
-                "algorithm": "PPO (tactical+executive) + REINFORCE (strategic)",
-                "strategic_lr": self.cfg.hrl.strategic_lr,
-                "tactical_lr": self.cfg.hrl.tactical_lr,
-                "executive_lr": self.cfg.hrl.executive_lr,
-                "n_options": self.cfg.hrl.strategic_options,
-                "rollout_length": self.rollout_length,
-                "reward_scale": self.cfg.hrl.reward_scale,
-                "curriculum_stages": self.cfg.curriculum.stages,
-                "steps_per_stage": self.cfg.curriculum.steps_per_stage,
+                "architecture": "Coordinator + 4 Function PPOs",
+                "coord_dim": COORD_ACTION_DIM,
+                "func_dim": FUNC_ACTION_DIM,
+                "coord_hidden": self.coord_ppo.policy.actor_mean[0].out_features
+                    if hasattr(self.coord_ppo.policy.actor_mean[0], 'out_features')
+                    else self.cfg.hrl.strategic_hidden,
+                **{f"{n}_hidden": self.func_ppos[n].policy.actor_mean[0].out_features
+                    if hasattr(self.func_ppos[n].policy.actor_mean[0], 'out_features')
+                    else self.cfg.hrl.executive_hidden
+                    for n in FUNC_NAMES},
                 "device": str(self.device),
             },
-            tags=["hrl", "ppo", "electronic-warfare", "phased-array-radar", "curriculum-learning"],
+            tags=["coordinated", "ppo", "electronic-warfare", "function-decomposition"],
         )
 
         obs, _ = self.env.reset()
@@ -140,136 +159,100 @@ class HRLTrainer:
         episode_reward = 0.0
         episode_step = 0
 
-        # Option tracking
-        current_option = None
-        option_onehot = np.zeros(self.cfg.hrl.strategic_options, dtype=np.float32)
-        option_start_step = 0
-        option_probs = np.zeros(self.cfg.hrl.strategic_options, dtype=np.float32)
-
-        # Last resource_alloc for executive state construction
-        last_resource_alloc = np.zeros(self.resource_dim, dtype=np.float32)
-        # Tactical persistence: resample every N steps for hierarchical time separation
-        tac_step_counter = 0
-        tac_duration = self.cfg.hrl.option_duration_min  # tactical slower than executive
+        # Coordinator persistence
+        coord_budget = np.zeros(COORD_ACTION_DIM, dtype=np.float32)
+        coord_log_prob = np.zeros(COORD_ACTION_DIM, dtype=np.float32)
+        coord_value = 0.0
+        coord_step_counter = 0
+        coord_duration = self.cfg.hrl.option_duration_min  # resample every N steps
 
         start_time = time.time()
 
         while self.total_steps < self.cfg.total_steps:
-            # --- Strategic layer: select option ---
-            option_duration = episode_step - option_start_step
-            should_replan = (
-                current_option is None
-                or option_duration >= self.cfg.hrl.option_duration_max
-            )
+            # --- Coordinator: sample budget every coord_duration steps ---
+            if coord_step_counter >= coord_duration or self.total_steps == 0:
+                coord_step_counter = 0
+                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+                coord_action, coord_log_prob, coord_value = \
+                    self.coord_ppo.select_action(obs_t, deterministic=False)
+                coord_budget = coord_action.copy()
+            coord_step_counter += 1
 
-            # β termination: early replanning after min duration
-            if not should_replan and option_duration >= self.cfg.hrl.option_duration_min \
-                    and self.strategic_buffer.size > 100:
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                term_prob = self.strategic.get_termination(
-                    obs_tensor,
-                    torch.FloatTensor(option_onehot).unsqueeze(0).to(self.device),
-                ).item()
-                should_replan = np.random.random() < term_prob
+            # --- Function policies: each outputs its 34-dim sub-action ---
+            func_state = np.concatenate([obs, coord_budget])
+            func_state_t = torch.FloatTensor(func_state).unsqueeze(0).to(self.device)
 
-            if should_replan or current_option is None:
-                # Flush previous option's strategic transitions
-                self.rollout.flush_strategic(
-                    self.cfg.hrl.gamma, self.strategic_buffer,
+            func_actions = []
+            func_log_probs = []
+            func_values = []
+            for name in FUNC_NAMES:
+                act, lp, val = self.func_ppos[name].select_action(
+                    func_state_t, deterministic=False,
                 )
+                func_actions.append(act)
+                func_log_probs.append(lp)
+                func_values.append(val)
 
-                # Select new option
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                with torch.no_grad():
-                    option, logits, value, _ = self.strategic.get_option(
-                        obs_tensor, deterministic=False,
-                    )
-                    current_option = option[0].item() if option.dim() > 0 else option.item()
-                    option_probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
-                    option_onehot = np.zeros(self.cfg.hrl.strategic_options, dtype=np.float32)
-                    option_onehot[current_option] = 1.0
-                option_start_step = episode_step
-
-            # --- Tactical layer (PPO): allocate resources (persists for K steps) ---
-            should_resample_tac = (tac_step_counter >= tac_duration) or should_replan \
-                or current_option is None
-            if should_resample_tac:
-                tac_step_counter = 0
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                opt_tensor = torch.FloatTensor(option_onehot).unsqueeze(0).to(self.device)
-                tac_state = torch.cat([obs_tensor, opt_tensor], dim=-1)
-                resource_action, tac_log_prob, tac_value = self.tactical_ppo.select_action(
-                    tac_state, deterministic=False,
-                )
-                cached_resource_action = resource_action.copy()
-                cached_tac_log_prob = tac_log_prob
-                cached_tac_value = tac_value
-            else:
-                resource_action = cached_resource_action
-                tac_log_prob = cached_tac_log_prob
-                tac_value = cached_tac_value
-            tac_step_counter += 1
-
-            # --- Executive layer (PPO): fine-grained parameters ---
-            res_tensor = torch.FloatTensor(resource_action).unsqueeze(0).to(self.device)
-            obs_tensor2 = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-            exec_state = torch.cat([obs_tensor2, res_tensor], dim=-1)
-            final_action, exec_log_prob, exec_value = self.executive_ppo.select_action(
-                exec_state, deterministic=False,
-            )
+            # Compose full 136-dim action: concatenate 4 x 34
+            full_action = np.concatenate(func_actions, axis=-1)
 
             # --- Environment step ---
-            next_obs, reward, terminated, truncated, info = self.env.step(final_action)
+            next_obs, reward, terminated, truncated, info = self.env.step(full_action)
             next_obs = self.obs_normalizer(next_obs)
             scaled_reward = self.reward_normalizer(reward, terminated)
+
+            # Per-function rewards from env info
+            func_rewards = info.get("function_rewards", {})
+            detect_r = func_rewards.get("detect", 0.0)
+            recon_r = func_rewards.get("recon", 0.0)
+            jam_r = func_rewards.get("jam", 0.0)
+            comm_r = func_rewards.get("comm", 0.0)
+
             episode_reward += reward
             episode_step += 1
             self.total_steps += 1
 
             # Store in rollout buffer
             self.rollout.push(
-                obs.copy(), current_option, option_probs.copy(), option_onehot.copy(),
-                resource_action.copy(), final_action.copy(),
-                tac_log_prob, tac_value,
-                exec_log_prob, exec_value,
-                scaled_reward, terminated,
+                obs.copy(),
+                coord_budget.copy(), coord_log_prob, coord_value,
+                func_actions, func_log_probs, func_values,
+                scaled_reward,
+                np.array([detect_r, recon_r, jam_r, comm_r], dtype=np.float32),
+                terminated,
             )
-            # Track for option-level returns
-            self.rollout.option_step_rewards.append(scaled_reward)
-            self.rollout.option_ptr_indices.append(self.rollout.ptr - 1)
+            # Track coordinator step
+            self.rollout.coord_step_flags.append(coord_step_counter == 1)
 
-            last_resource_alloc = resource_action
-
-            # Step-level wandb logging (every 100 steps)
+            # Step-level logging
             if self.total_steps % 100 == 0:
-                wandb.log({"step/reward": reward,
-                           "step/curriculum_stage": self.curriculum.current_stage},
-                          step=self.total_steps)
+                wandb.log({
+                    "step/reward": reward,
+                    "step/curriculum_stage": self.curriculum.current_stage,
+                    "step/detect_r": detect_r,
+                    "step/recon_r": recon_r,
+                    "step/jam_r": jam_r,
+                    "step/comm_r": comm_r,
+                }, step=self.total_steps)
 
             obs = next_obs
 
             # --- PPO Update when rollout buffer is full ---
             if self.rollout.full():
-                # Compute bootstrap values from current networks
                 with torch.no_grad():
+                    # Bootstrap values for coordinator
                     obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                    opt_t = torch.FloatTensor(option_onehot).unsqueeze(0).to(self.device)
-                    res_t = torch.FloatTensor(last_resource_alloc).unsqueeze(0).to(self.device)
+                    bs_coord = self.coord_ppo.policy.get_value(obs_t).item()
 
-                    tac_state_t = torch.cat([obs_t, opt_t], dim=-1)
-                    bootstrap_tac = self.tactical_ppo.policy.get_value(tac_state_t).item()
+                    # Bootstrap values for function policies
+                    func_state_boot = np.concatenate([obs, coord_budget])
+                    fs_t = torch.FloatTensor(func_state_boot).unsqueeze(0).to(self.device)
+                    bs_funcs = [
+                        self.func_ppos[n].policy.get_value(fs_t).item()
+                        for n in FUNC_NAMES
+                    ]
 
-                    exec_state_t = torch.cat([obs_t, res_t], dim=-1)
-                    bootstrap_exec = self.executive_ppo.policy.get_value(exec_state_t).item()
-
-                self._ppo_update(bootstrap_tac, bootstrap_exec)
-
-            # --- Strategic update from persistent buffer ---
-            if self.strategic_buffer.size > self.cfg.hrl.batch_size * 2:
-                strat_batch = self.strategic_buffer.sample_strategic(
-                    self.cfg.hrl.batch_size, self.device,
-                )
-                self._update_strategic(strat_batch)
+                self._ppo_update(bs_coord, bs_funcs)
 
             # Curriculum advancement
             stage_advanced = self.curriculum.update(reward)
@@ -278,15 +261,13 @@ class HRLTrainer:
                 self.env.set_curriculum_stage(new_stage)
                 print(f"\n>>> Advanced to curriculum stage {new_stage}: "
                       f"{CurriculumScheduler.STAGES[new_stage]['name']}")
-                wandb.log({"curriculum/stage": new_stage,
-                           "curriculum/name": CurriculumScheduler.STAGES[new_stage]['name']},
-                          step=self.total_steps)
+                wandb.log({
+                    "curriculum/stage": new_stage,
+                    "curriculum/name": CurriculumScheduler.STAGES[new_stage]['name'],
+                }, step=self.total_steps)
 
             # Episode end
             if terminated or truncated:
-                self.rollout.flush_strategic(
-                    self.cfg.hrl.gamma, self.strategic_buffer,
-                )
                 obs, _ = self.env.reset()
                 obs = self.obs_normalizer(obs)
                 self.episodes += 1
@@ -297,14 +278,14 @@ class HRLTrainer:
                     "episode/count": self.episodes,
                 }, step=self.total_steps)
 
-                current_option = None
                 episode_step = 0
+                coord_step_counter = coord_duration  # force resample
 
                 if self.episodes % 10 == 0:
                     elapsed = time.time() - start_time
+                    stage = self.curriculum.current_stage
                     print(f"Ep {self.episodes:5d} | Steps {self.total_steps:7d} | "
-                          f"Reward {episode_reward:7.2f} | "
-                          f"Stage {self.curriculum.current_stage} | "
+                          f"Reward {episode_reward:7.2f} | Stage {stage} | "
                           f"Time {elapsed:.0f}s")
 
                 episode_reward = 0.0
@@ -325,123 +306,94 @@ class HRLTrainer:
             if self.total_steps % self.cfg.save_interval == 0:
                 self.save_checkpoint()
 
-        # Final update with remaining rollout data
-        if len(self.rollout) > self.cfg.hrl.batch_size:
+        # Final update with remaining data
+        n = len(self.rollout)
+        if n > self.cfg.hrl.batch_size:
             with torch.no_grad():
                 obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
-                opt_t = torch.FloatTensor(option_onehot).unsqueeze(0).to(self.device)
-                res_t = torch.FloatTensor(last_resource_alloc).unsqueeze(0).to(self.device)
-                tac_state_t = torch.cat([obs_t, opt_t], dim=-1)
-                btac = self.tactical_ppo.policy.get_value(tac_state_t).item()
-                exec_state_t = torch.cat([obs_t, res_t], dim=-1)
-                bexec = self.executive_ppo.policy.get_value(exec_state_t).item()
-            self._ppo_update(btac, bexec)
+                bs_coord = self.coord_ppo.policy.get_value(obs_t).item()
+                fs_t = torch.FloatTensor(
+                    np.concatenate([obs, coord_budget])
+                ).unsqueeze(0).to(self.device)
+                bs_funcs = [
+                    self.func_ppos[n].policy.get_value(fs_t).item()
+                    for n in FUNC_NAMES
+                ]
+            self._ppo_update(bs_coord, bs_funcs)
 
         elapsed = time.time() - start_time
         print(f"\nTraining complete in {elapsed:.0f}s ({elapsed/3600:.1f}h)")
         wandb.log({"training/duration_h": elapsed / 3600.0}, step=self.total_steps)
         wandb.finish()
-        return {"total_steps": self.total_steps, "episodes": self.episodes,
-                "metrics_history": self.metrics_history}
+        return {
+            "total_steps": self.total_steps, "episodes": self.episodes,
+            "metrics_history": self.metrics_history,
+        }
 
-    def _ppo_update(self, bootstrap_tac: float = 0.0, bootstrap_exec: float = 0.0):
-        """CleanRL-style PPO update for tactical and executive layers."""
+    def _ppo_update(self, bootstrap_coord: float, bootstrap_funcs: list):
+        """PPO update for coordinator and all function policies."""
         self._update_count += 1
         n = len(self.rollout)
 
-        # --- Tactical layer ---
-        tac_advantages, tac_returns = self.rollout.compute_gae(
-            self.cfg.hrl.gamma,
-            self.cfg.hrl.gae_lambda,
-            self.rollout.tac_values[:n],
-            bootstrap_value=bootstrap_tac,
+        # --- Coordinator update (over persistence windows) ---
+        coord_rewards = self.rollout.coord_rewards[:n]
+        coord_values = self.rollout.coord_values[:n]
+        coord_advantages, coord_returns = _compute_gae(
+            coord_rewards, coord_values,
+            self.cfg.hrl.gamma, self.cfg.hrl.gae_lambda,
+            self.rollout.dones[:n], bootstrap_coord,
+        )
+        coord_losses = self.coord_ppo.update(
+            torch.FloatTensor(self.rollout.coord_states[:n]),
+            torch.FloatTensor(self.rollout.coord_actions[:n]),
+            torch.FloatTensor(self.rollout.coord_log_probs[:n]),
+            torch.FloatTensor(coord_advantages),
+            torch.FloatTensor(coord_returns),
+            torch.FloatTensor(coord_values),
         )
 
-        tac_losses = self.tactical_ppo.update(
-            torch.FloatTensor(self.rollout.tac_states[:n]),
-            torch.FloatTensor(self.rollout.tac_actions[:n]),
-            torch.FloatTensor(self.rollout.tac_log_probs[:n]).squeeze(-1),
-            torch.FloatTensor(tac_advantages).squeeze(-1),
-            torch.FloatTensor(tac_returns).squeeze(-1),
-            torch.FloatTensor(self.rollout.tac_values[:n]).squeeze(-1),
-        )
+        # --- Function policy updates (per-function rewards, per-dim log_probs) ---
+        func_losses = {}
+        func_obs = torch.FloatTensor(self.rollout.func_states[:n])
+        for i, name in enumerate(FUNC_NAMES):
+            func_rewards = self.rollout.func_rewards[:n, i]
+            func_actions_t = torch.FloatTensor(self.rollout.func_actions[:n, i, :])
+            func_log_probs_t = torch.FloatTensor(self.rollout.func_log_probs[:n, i, :])
+            func_values_t = torch.FloatTensor(self.rollout.func_values[:n, i])
 
-        # --- Executive layer ---
-        exec_advantages, exec_returns = self.rollout.compute_gae(
-            self.cfg.hrl.gamma,
-            self.cfg.hrl.gae_lambda,
-            self.rollout.exec_values[:n],
-            bootstrap_value=bootstrap_exec,
-        )
+            func_advantages, func_returns = _compute_gae(
+                func_rewards, func_values_t.numpy(),
+                self.cfg.hrl.gamma, self.cfg.hrl.gae_lambda,
+                self.rollout.dones[:n], bootstrap_funcs[i],
+            )
+            losses = self.func_ppos[name].update(
+                func_obs,
+                func_actions_t,
+                func_log_probs_t,
+                torch.FloatTensor(func_advantages),
+                torch.FloatTensor(func_returns),
+                func_values_t,
+            )
+            func_losses[name] = losses
 
-        exec_losses = self.executive_ppo.update(
-            torch.FloatTensor(self.rollout.exec_states[:n]),
-            torch.FloatTensor(self.rollout.exec_actions[:n]),
-            torch.FloatTensor(self.rollout.exec_log_probs[:n]).squeeze(-1),
-            torch.FloatTensor(exec_advantages).squeeze(-1),
-            torch.FloatTensor(exec_returns).squeeze(-1),
-            torch.FloatTensor(self.rollout.exec_values[:n]).squeeze(-1),
-        )
-
-        # Log PPO losses
-        wandb.log({
-            "loss/tac_actor": tac_losses["actor_loss"],
-            "loss/tac_critic": tac_losses["critic_loss"],
-            "loss/tac_entropy": tac_losses["entropy"],
-            "loss/tac_kl": tac_losses["approx_kl"],
-            "loss/tac_clipfrac": tac_losses["clipfrac"],
-            "loss/exec_actor": exec_losses["actor_loss"],
-            "loss/exec_critic": exec_losses["critic_loss"],
-            "loss/exec_entropy": exec_losses["entropy"],
-            "loss/exec_kl": exec_losses["approx_kl"],
-            "loss/exec_clipfrac": exec_losses["clipfrac"],
+        # Logging
+        log_dict = {
+            "loss/coord_actor": coord_losses["actor_loss"],
+            "loss/coord_critic": coord_losses["critic_loss"],
+            "loss/coord_entropy": coord_losses["entropy"],
+            "loss/coord_clipfrac": coord_losses["clipfrac"],
             "ppo/update": self._update_count,
-        }, step=self.total_steps)
+        }
+        for name in FUNC_NAMES:
+            log_dict[f"loss/{name}_actor"] = func_losses[name]["actor_loss"]
+            log_dict[f"loss/{name}_critic"] = func_losses[name]["critic_loss"]
+            log_dict[f"loss/{name}_clipfrac"] = func_losses[name]["clipfrac"]
+        wandb.log(log_dict, step=self.total_steps)
 
         self.rollout.clear()
 
-    def _update_strategic(self, batch: Tuple):
-        obs, options, returns, next_obs, dones, old_probs = batch
-
-        option_logits, values, _ = self.strategic(obs)
-        new_probs = torch.softmax(option_logits, dim=-1)
-        selected_new_probs = new_probs.gather(1, options.unsqueeze(-1))
-        selected_old_probs = old_probs.gather(1, options.unsqueeze(-1))
-
-        # Importance sampling ratio for off-policy correction
-        is_ratio = selected_new_probs / (selected_old_probs + 1e-8)
-        is_ratio = torch.clamp(is_ratio, 0.5, 2.0)  # clip for stability
-
-        log_probs = torch.log_softmax(option_logits, dim=-1)
-        selected_log_probs = log_probs.gather(1, options.unsqueeze(-1))
-
-        # Advantage: raw returns minus value baseline, normalize advantage only
-        advantage = returns - values.detach()
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-
-        policy_loss = -(is_ratio * selected_log_probs * advantage).mean()
-        value_loss = nn.MSELoss()(values, returns)
-
-        total_loss = policy_loss + 0.5 * value_loss
-
-        entropy = -(new_probs * torch.log(new_probs + 1e-8)).sum(-1).mean()
-        total_loss -= 0.01 * entropy
-
-        self.strategic_optim.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.strategic.parameters(), 10.0)
-        self.strategic_optim.step()
-
-        if self._update_count % 20 == 0:
-            wandb.log({
-                "loss/strat_total": total_loss.item(),
-                "loss/strat_policy": policy_loss.item(),
-                "loss/strat_value": value_loss.item(),
-                "loss/strat_entropy": entropy.item(),
-            }, step=self.total_steps)
-
     def evaluate(self) -> Dict:
-        """Run evaluation episodes with deterministic actions (fresh env, no state leak)."""
+        """Run evaluation with deterministic actions on a fresh env."""
         eval_env = IntegratedRadarEnv(
             config=copy.deepcopy(self._eval_env_config),
             curriculum_stage=self.curriculum.current_stage,
@@ -453,33 +405,31 @@ class HRLTrainer:
             obs = self.obs_normalizer.normalize(obs)
             ep_reward = 0.0
             done = False
+            coord_step = 0
 
             while not done:
-                obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+                obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
 
-                # Get option (deterministic)
-                option, _, _, _ = self.strategic.get_option(
-                    obs_tensor, deterministic=True,
-                )
-                opt_idx = option.item() if option.dim() > 1 else option.item()
-                option_onehot = np.zeros(self.cfg.hrl.strategic_options, dtype=np.float32)
-                option_onehot[opt_idx] = 1.0
-                opt_tensor = torch.FloatTensor(option_onehot).unsqueeze(0).to(self.device)
+                # Coordinator (deterministic, resampled every coord_duration steps)
+                if coord_step % self.cfg.hrl.option_duration_min == 0:
+                    coord_action, _, _ = self.coord_ppo.select_action(
+                        obs_t, deterministic=True,
+                    )
+                coord_step += 1
 
-                # Tactical (deterministic)
-                tac_state = torch.cat([obs_tensor, opt_tensor], dim=-1)
-                res_action, _, _ = self.tactical_ppo.select_action(
-                    tac_state, deterministic=True,
-                )
+                # Function policies (deterministic)
+                func_state = np.concatenate([obs, coord_action])
+                fs_t = torch.FloatTensor(func_state).unsqueeze(0).to(self.device)
 
-                # Executive (deterministic)
-                res_tensor = torch.FloatTensor(res_action).unsqueeze(0).to(self.device)
-                exec_state = torch.cat([obs_tensor, res_tensor], dim=-1)
-                action, _, _ = self.executive_ppo.select_action(
-                    exec_state, deterministic=True,
-                )
+                func_actions = []
+                for name in FUNC_NAMES:
+                    act, _, _ = self.func_ppos[name].select_action(
+                        fs_t, deterministic=True,
+                    )
+                    func_actions.append(act)
 
-                obs, reward, terminated, truncated, _ = eval_env.step(action)
+                full_action = np.concatenate(func_actions, axis=-1)
+                obs, reward, terminated, truncated, _ = eval_env.step(full_action)
                 obs = self.obs_normalizer.normalize(obs)
                 ep_reward += reward
                 done = terminated or truncated
@@ -493,16 +443,17 @@ class HRLTrainer:
 
     def save_checkpoint(self):
         os.makedirs(self.cfg.model_dir, exist_ok=True)
-        path = os.path.join(self.cfg.model_dir, f"hrl_step{self.total_steps}.pt")
-        torch.save({
-            "strategic": self.strategic.state_dict(),
-            "tactical_policy": self.tactical_ppo.policy.state_dict(),
-            "executive_policy": self.executive_ppo.policy.state_dict(),
+        path = os.path.join(self.cfg.model_dir, f"coord_step{self.total_steps}.pt")
+        state = {
+            "coord_policy": self.coord_ppo.policy.state_dict(),
             "total_steps": self.total_steps,
             "episodes": self.episodes,
             "curriculum_stage": self.curriculum.current_stage,
             "metrics": self.metrics_history,
-        }, path)
+        }
+        for name in FUNC_NAMES:
+            state[f"{name}_policy"] = self.func_ppos[name].policy.state_dict()
+        torch.save(state, path)
         print(f"Checkpoint saved: {path}")
 
     def save_results(self):
@@ -511,3 +462,110 @@ class HRLTrainer:
         with open(path, "w") as f:
             json.dump(self.metrics_history, f, indent=2)
         print(f"Results saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Rollout buffer for coordinated architecture
+# ---------------------------------------------------------------------------
+
+class _CoordRolloutBuffer:
+    """On-policy rollout buffer for Coordinator + 4 Function Policies.
+
+    Stores:
+      - Coordinator: states, actions, log_probs, values, scalar rewards
+      - Functions: states (obs+budget), actions(4x34), log_probs(4), values(4),
+        per-function rewards(4)
+    """
+
+    def __init__(self, capacity: int, obs_dim: int, coord_dim: int, func_dim: int):
+        self.capacity = capacity
+        self.ptr = 0
+
+        # Coordinator arrays
+        self.coord_states = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.coord_actions = np.zeros((capacity, coord_dim), dtype=np.float32)
+        self.coord_log_probs = np.zeros((capacity, coord_dim), dtype=np.float32)
+        self.coord_values = np.zeros((capacity,), dtype=np.float32)
+        self.coord_rewards = np.zeros((capacity,), dtype=np.float32)
+
+        # Function arrays (4 functions, per-dim log_probs)
+        self.func_states = np.zeros((capacity, obs_dim + coord_dim), dtype=np.float32)
+        self.func_actions = np.zeros((capacity, 4, func_dim), dtype=np.float32)
+        self.func_log_probs = np.zeros((capacity, 4, func_dim), dtype=np.float32)
+        self.func_values = np.zeros((capacity, 4), dtype=np.float32)
+        self.func_rewards = np.zeros((capacity, 4), dtype=np.float32)
+
+        # Shared
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+
+        # Bookkeeping: which steps start a new coordinator window
+        self.coord_step_flags = []
+
+    def push(
+        self,
+        obs: np.ndarray,
+        coord_action: np.ndarray,
+        coord_log_prob: np.ndarray,   # per-dim, shape (coord_dim,)
+        coord_value: float,
+        func_actions: list,
+        func_log_probs: list,         # list of 4 per-dim arrays, each (func_dim,)
+        func_values: list,
+        reward: float,
+        func_rewards: np.ndarray,
+        done: bool,
+    ):
+        if self.ptr >= self.capacity:
+            return
+
+        self.coord_states[self.ptr] = obs
+        self.coord_actions[self.ptr] = coord_action
+        self.coord_log_probs[self.ptr] = coord_log_prob
+        self.coord_values[self.ptr] = coord_value
+        self.coord_rewards[self.ptr] = reward
+
+        self.func_states[self.ptr] = np.concatenate([obs, coord_action])
+        for i in range(4):
+            self.func_actions[self.ptr, i] = func_actions[i]
+            self.func_log_probs[self.ptr, i] = func_log_probs[i]
+            self.func_values[self.ptr, i] = func_values[i]
+        self.func_rewards[self.ptr] = func_rewards
+
+        self.dones[self.ptr] = float(done)
+        self.ptr += 1
+
+    def __len__(self):
+        return self.ptr
+
+    def full(self):
+        return self.ptr >= self.capacity
+
+    def clear(self):
+        self.ptr = 0
+        self.coord_step_flags = []
+
+
+def _compute_gae(
+    rewards: np.ndarray,
+    values: np.ndarray,
+    gamma: float,
+    gae_lambda: float,
+    dones: np.ndarray,
+    bootstrap_value: float,
+):
+    """Compute GAE advantages and returns."""
+    n = len(rewards)
+    advantages = np.zeros(n, dtype=np.float32)
+    returns = np.zeros(n, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(n)):
+        if dones[t] > 0.5:
+            next_value = 0.0
+        elif t == n - 1:
+            next_value = bootstrap_value
+        else:
+            next_value = values[t + 1]
+        delta = rewards[t] + gamma * next_value - values[t]
+        gae = delta + gamma * gae_lambda * (1.0 - dones[t]) * gae
+        advantages[t] = gae
+        returns[t] = gae + values[t]
+    return advantages, returns

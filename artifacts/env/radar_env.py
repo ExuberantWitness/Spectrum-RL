@@ -228,7 +228,6 @@ class IntegratedRadarEnv(gym.Env):
     def _simulate_detection(self, resources: dict) -> dict:
         """Simulate radar target detection performance."""
         c = self.cfg
-        n_detected = 0
         total_pd = 0.0
 
         for tgt in self.targets:
@@ -240,8 +239,8 @@ class IntegratedRadarEnv(gym.Env):
                 if ang_err < best_ang_err:
                     best_ang_err = ang_err
 
-            if best_ang_err < 5.0:
-                beam_gain_loss = (best_ang_err / 5.0) ** 2 * 3.0
+            if best_ang_err < 10.0:
+                beam_gain_loss = (best_ang_err / 10.0) ** 2 * 3.0
             else:
                 beam_gain_loss = 20.0  # sidelobe
 
@@ -263,19 +262,15 @@ class IntegratedRadarEnv(gym.Env):
                 c.system_loss_db,
             )
             pd = self.channel.detection_probability(snr)
-            detected = self.np_random.random() < pd
-            if detected:
-                n_detected += 1
-                tgt.detected = True
-            else:
-                tgt.detected = False
+            # Use continuous expected Pd (not stochastic binary) for low-variance reward
+            tgt.detected = pd > 0.5
             total_pd += pd
 
+        n_targets = max(c.num_targets, 1)
         return {
-            "n_detected": n_detected,
-            "total_targets": c.num_targets,
-            "avg_pd": total_pd / max(c.num_targets, 1),
-            "success": n_detected / max(c.num_targets, 1),
+            "total_targets": n_targets,
+            "avg_pd": total_pd / n_targets,
+            "success": total_pd / n_targets,  # continuous: mean Pd, not binary count
         }
 
     def _simulate_reconnaissance(self, resources: dict) -> dict:
@@ -324,8 +319,8 @@ class IntegratedRadarEnv(gym.Env):
     def _simulate_jamming(self, resources: dict) -> dict:
         """Simulate electronic jamming against opponents."""
         c = self.cfg
-        n_jammed = 0
         total_jsr = 0.0
+        total_effectiveness = 0.0
 
         for opp in self.opponents:
             rel = opp.position - self.radar_pos
@@ -343,17 +338,17 @@ class IntegratedRadarEnv(gym.Env):
             jsr_db += c.antenna_gain_db - c.system_loss_db
             jsr_db -= 20 * np.log10(max(opp_range / 50.0, 1.0))
 
-            # Effective if JSR > threshold
-            effective = jsr_db > 3.0  # 3 dB JSR for effective jamming
-            if effective:
-                n_jammed += 1
+            # Continuous effectiveness: sigmoid around 3 dB threshold
+            effectiveness = 1.0 / (1.0 + np.exp(-(jsr_db - 3.0)))
+            total_effectiveness += effectiveness
             total_jsr += jsr_db
 
+        n_opp = max(c.num_opponents, 1)
         return {
-            "n_jammed": n_jammed,
-            "total_opponents": c.num_opponents,
-            "avg_jsr_db": total_jsr / max(c.num_opponents, 1),
-            "effectiveness": n_jammed / max(c.num_opponents, 1),
+            "n_jammed": int(total_effectiveness >= c.num_opponents * 0.5),
+            "total_opponents": n_opp,
+            "avg_jsr_db": total_jsr / n_opp,
+            "effectiveness": total_effectiveness / n_opp,
         }
 
     def _simulate_communication(self, resources: dict) -> dict:
@@ -418,21 +413,41 @@ class IntegratedRadarEnv(gym.Env):
 
         r_detect = detect["success"] * w[0]
         r_recon = recon["coverage"] * w[1]
-        r_jam = jam["effectiveness"] * w[2]
+        # Continuous jamming reward (sigmoid around 3 dB threshold instead of binary)
+        r_jam = (1.0 / (1.0 + np.exp(-(jam["avg_jsr_db"] - 3.0)))) * w[2]
         r_comm = np.tanh(comm["rate"] / 100.0) * w[3]
 
-        # Bonus for balanced performance
-        balance = 1.0 - np.std([detect["success"], recon["coverage"],
-                                 jam["effectiveness"],
-                                 min(comm["rate"] / 200.0, 1.0)])
+        # Balance bonus: only active functions (weight > 0)
+        active_scores = []
+        active_weights = []
+        for score, weight in zip(
+            [detect["success"], recon["coverage"], jam.get("effectiveness", 0.0),
+             min(comm["rate"] / 200.0, 1.0)],
+            w
+        ):
+            if weight > 0:
+                active_scores.append(score)
+                active_weights.append(weight)
+        if len(active_scores) > 1:
+            balance = 1.0 - np.std(active_scores)
+        else:
+            balance = 0.0
 
-        # Penalty for resource overuse
+        # Stronger penalty for resource overuse
         res = self._last_resources if hasattr(self, '_last_resources') else {}
         power_db = res.get("power_db", np.array([40.0, 30.0, 35.0, 25.0]))
         total_power = 10 * np.log10(np.sum(10 ** (power_db / 10.0)) + 1e-10)
-        power_penalty = max(0.0, total_power - self.cfg.max_power_db) * 0.01
+        power_penalty = max(0.0, total_power - self.cfg.max_power_db) * 0.1
 
         reward = r_detect + r_recon + r_jam + r_comm + 0.1 * balance - power_penalty
+        self._last_component_rewards = {
+            "detect": float(r_detect),
+            "recon": float(r_recon),
+            "jam": float(r_jam),
+            "comm": float(r_comm),
+            "balance": float(0.1 * balance),
+            "power_penalty": float(power_penalty),
+        }
         return float(reward)
 
     def _get_function_weights(self) -> np.ndarray:
@@ -534,10 +549,13 @@ class IntegratedRadarEnv(gym.Env):
         ], dtype=np.float32)
 
     def _get_info(self) -> dict:
-        return {
+        info = {
             "time_step": self.time_step,
             "function_weights": self._get_function_weights(),
         }
+        if hasattr(self, '_last_component_rewards'):
+            info["function_rewards"] = self._last_component_rewards
+        return info
 
     def set_curriculum_stage(self, stage: int):
         self.curriculum_stage = stage
